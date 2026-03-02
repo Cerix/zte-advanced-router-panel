@@ -139,7 +139,7 @@
       "background:" +
       colors[type || "info"] +
       ";color:#fff;" +
-      "padding:12px 20px;:8px;font-family:Segoe UI,Verdana,sans-serif;" +
+      "padding:12px 20px;border-radius:8px;font-family:Segoe UI,Verdana,sans-serif;" +
       "font-size:13px;box-shadow:0 4px 15px rgba(0,0,0,.25);max-width:360px;" +
       "word-wrap:break-word;transition:opacity .3s, top .3s ease-out;";
     el.textContent = msg;
