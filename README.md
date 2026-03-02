@@ -1,6 +1,6 @@
 # ZTE Advanced Router Panel
 
-** Userscript for ZTE MC888 / MC889 **  
+**Userscript for ZTE MC888 / MC889**  
 Version 2026-v5.3 — by [Cerix](https://buymeacoffee.com/cerix)
 
 A floating control panel injected directly into the router's web UI that exposes signal data, band locking, cell locking, traffic statistics and device info that the stock firmware deliberately hides or makes hard to reach.
