@@ -43,7 +43,7 @@ A floating control panel injected directly into the router's web UI that exposes
 
 1. Install **Tampermonkey** from your browser's extension store.
 2. Open the Tampermonkey dashboard → **Create a new script**.
-3. Delete the default template, paste the entire content of `ZTE_Router_Enhanced_Panel.user.js` and save.
+3. Delete the default template, paste the entire content of `ZTE Advanced Router Panel.user.js` and save.
 4. Navigate to your router IP: [http://192.168.192.1](http://192.168.192.1).
 5. Log in — the panel appears automatically in the top-left corner.
 
