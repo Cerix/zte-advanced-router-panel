@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ZTE Advanced Router Panel
 // @namespace    Cerix
-// @version      2026-v5.3
+// @version      2026-v5.14
 // @description  ZTE signal monitor: eNodeB, BTS scan, force-connect, band lock, cell lock, bridge mode, DNS, NR CA, traffic stats, device info, GPS
 // @author       Cerix
 // @match        http://192.168.192.1/*
@@ -20,8 +20,8 @@
   //  CONFIGURATION
   // ─────────────────────────────────────────────
   var CFG = {
-    version: "2026-v5.3",
-    bmac: true, // set false to hide the Buy Me a Coffee section
+    version: "2026-v5.14",
+    bmac: true,
     pollInterval: 1000,
     trafficPollInterval: 2000,
     devicePollInterval: 60000,
@@ -32,6 +32,16 @@
     scanInterval: 3000,
     scanTotalTime: 18000,
     ajaxTimeout: 10000,
+    // "page"    = use the router page's own window.SHA256 (= paswordAlgorithmsCookie in service.js)
+    // "builtin" = use our embedded SHA256 (also returns UPPERCASE output)
+    sha_mode: "page",
+    // true = log intermediate login values to console (ph, LD, RD, password, AD)
+    debug_login: false,
+    // true = automatically reveal hidden router menus on every page, even after navigation
+    show_hidden_default: true,
+    // Hours between automatic IP reassignment (Very/Wind SIMs reconnect every 4h).
+    // Set to 0 to disable the countdown display.
+    ip_cycle_hours: 4,
   };
 
   // ─────────────────────────────────────────────
@@ -229,7 +239,7 @@
         toast("Failed to get AD token", "error");
         return;
       }
-      var ad = S.hash_fn(S.hash_fn(a.wa_inner_version + a.cr_version) + a.RD);
+      var ad = S.hash_fn(S.hash_fn(a.wa_inner_version + a.cr_version) + a.RD).toUpperCase();
       cb(ad, a);
     });
   }
@@ -246,56 +256,166 @@
       { cmd: "loginfo" },
       function (a) {
         if (a && a.loginfo && a.loginfo.toLowerCase() === "ok") ok && ok();
-        else fail && fail();
+        else {
+          // Session expired — reset developer flag too
+          S.logged_in_as_developer = false;
+          fail && fail();
+        }
       },
       fail || null,
     );
   }
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  EXACT formula from service.js (WEB_ATTR_IF_SUPPORT_SHA256 == "2"):
+  //
+  //    ph       = paswordAlgorithmsCookie(rawPassword)         ← no toUpperCase
+  //    password = paswordAlgorithmsCookie(ph + LD)             ← no toUpperCase
+  //    AD       = cookWithRequest(cookWithRequest(rd0+rd1)+RD) ← no toUpperCase
+  //
+  //  where rd0=wa_inner_version, rd1=cr_version
+  //  Letter case is determined by the hash function implementation:
+  //    sha_mode="page"    → router page's window.SHA256 (returns UPPERCASE)
+  //    sha_mode="builtin" → our embedded SHA256 (also returns UPPERCASE)
+  //  In both cases we do NOT add toUpperCase in our code.
+  // ─────────────────────────────────────────────────────────────────────────────
   function perform_login(successCb, dev_login, save) {
     dev_login = dev_login || false;
     save = save || false;
+
+    // ph = hash_fn(rawPassword) — read from cookie if available (already hashed)
     var ph = have_hash() ? cookies.get("admin_password_hash") : "";
     if (!ph) {
       var pw = prompt("Router Password:");
       if (!pw) return;
-      ph = window.SHA256
-        ? window.SHA256(pw)
-        : window.hex_md5
-          ? window.hex_md5(pw)
-          : pw;
+      ph = S.hash_fn(pw); // no toUpperCase — the hash function already returns the correct case
     }
+
     ajax_get({ cmd: "wa_inner_version,cr_version,RD,LD" }, function (a) {
-      var ad = S.hash_fn(S.hash_fn(a.wa_inner_version + a.cr_version) + a.RD);
+      if (!a || !a.RD || !a.LD) {
+        toast("Login failed: could not get router tokens", "error");
+        return;
+      }
+
+      // Exact replica of cookWithRequest(cookWithRequest(rd0+rd1)+RD)
+      var rd_inner = S.hash_fn(a.wa_inner_version + a.cr_version);
+      var ad       = S.hash_fn(rd_inner + a.RD);
+
+      // Exact replica of paswordAlgorithmsCookie(ph + LD)
+      var password = S.hash_fn(ph + a.LD);
+
+      if (CFG.debug_login) {
+        console.group("[ZTE] LOGIN DEBUG — compare with DevTools Network tab");
+        console.log("sha_mode     :", CFG.sha_mode);
+        console.log("goformId     :", dev_login ? "DEVELOPER_OPTION_LOGIN" : "LOGIN");
+        console.log("wa_inner_ver :", a.wa_inner_version);
+        console.log("cr_version   :", a.cr_version);
+        console.log("LD           :", a.LD);
+        console.log("RD           :", a.RD);
+        console.log("ph (SHA256(pw))   :", ph);
+        console.log("rd_inner (SHA(wa+cr)):", rd_inner);
+        console.log("password     :", password);
+        console.log("AD           :", ad);
+        console.groupEnd();
+      }
+
       ajax_post(
         {
           isTest: "false",
           goformId: dev_login ? "DEVELOPER_OPTION_LOGIN" : "LOGIN",
-          password: window.SHA256(ph + a.LD),
+          password: password,
           AD: ad,
         },
         function (raw) {
           var j = parse_result(raw);
-          if (j.result === "0") {
+          var r = j.result;
+          var ok = r === "0" || r === 0;
+
+          if (ok) {
             if (save) cookies.set("admin_password_hash", ph);
-            toast("Login successful!", "ok");
             successCb && successCb();
           } else {
-            var r = "Unknown error";
-            if (j.result === "1") r = "Please retry in a few seconds";
-            if (j.result === "3") {
-              r = "Wrong password";
+            var msg;
+            if (r === "3" || r === 3) {
+              msg = (dev_login ? "Developer login" : "Login") + " failed: wrong password";
               if (have_hash()) cookies.del("admin_password_hash");
+            } else if (r === "5" || r === 5) {
+              msg = (dev_login ? "Developer login" : "Login") + " failed: session busy, retry";
+            } else {
+              msg = (dev_login ? "Developer login" : "Login") + " failed (code: " + JSON.stringify(r) + ")";
             }
-            toast(
-              (dev_login ? "Developer login" : "Login") + " failed: " + r,
-              "error",
-            );
+            toast(msg, "error");
           }
         },
       );
     });
   }
+
+  // ─────────────────────────────────────────────
+  //  DEVELOPER LOGIN GUARD
+  //  The ZTE developer session is a SECOND authentication layer
+  //  on top of the normal admin session. The correct sequence is:
+  //    1. Ensure normal admin session is alive (check_login)
+  //    2. If not → perform normal LOGIN first
+  //    3. Then perform DEVELOPER_OPTION_LOGIN on top
+  //
+  //  S.logged_in_as_developer is reset whenever the admin
+  //  session is found to have expired so the guard re-runs
+  //  the full chain automatically.
+  // ─────────────────────────────────────────────
+  function do_developer_login(cb) {
+    var silent = have_hash(); // se c'è la password salvata non serve il prompt
+    if (!silent) toast("Developer login required — enter password when prompted", "info");
+    perform_login(
+      function () {
+        S.logged_in_as_developer = true;
+        toast("Developer session active ✓", "ok");
+        cb();
+      },
+      true /* dev_login = true */,
+    );
+  }
+
+  function ensure_developer_login(cb) {
+    // Fast path: already have a developer session
+    if (S.logged_in_as_developer) {
+      cb();
+      return;
+    }
+    // Step 1: verify the normal admin session is alive
+    check_login(
+      function () {
+        // Admin session OK → now do developer login on top
+        do_developer_login(cb);
+      },
+      function () {
+        // Admin session expired or missing → re-login as admin first
+        toast("Admin session expired — logging in...", "warn");
+        perform_login(
+          function () {
+            // Admin login restored → now do developer login on top
+            do_developer_login(cb);
+          },
+          false /* normal login */,
+        );
+      },
+    );
+  }
+
+  // Manual developer login button (exposed to UI)
+  window.zte_developer_login = function () {
+    // Reset flag so ensure_developer_login runs the full chain
+    S.logged_in_as_developer = false;
+    ensure_developer_login(function () {
+      toast("Developer session ready", "ok");
+    });
+  };
+
+  // Navigate to developer options page
+  window.zte_go_developer_options = function () {
+    window.location.hash = "developer_options";
+    toast("Navigating to Developer Options…", "info");
+  };
 
   window.zte_enable_auto_login = function () {
     if (
@@ -1216,6 +1336,9 @@
       ztoggle("zte_mccmnc_row", true);
     } else ztoggle("zte_mccmnc_row", false);
 
+    // Session duration + IP cycle countdown (driven by realtime_time from traffic poll)
+    update_session_info();
+
     // Cell lock status
     var lte_locked = d.lte_pci_lock && d.lte_pci_lock !== "0";
     if (lte_locked) {
@@ -1383,7 +1506,7 @@
     });
   };
 
-  window.zte_lte_band = function (bands, _dev) {
+  window.zte_lte_band = function (bands) {
     if (!bands)
       bands = prompt(
         "LTE Bands (e.g., 1+3+20)\nType AUTO to remove all band locks.",
@@ -1407,33 +1530,31 @@
       toast("Invalid band input — use format: 1+3+7 or AUTO", "error");
       return;
     }
-    var mask = "0x" + ("00000000000" + n.toString(16)).slice(-11);
-    get_ad_token(function (ad) {
-      ajax_post(
-        {
-          isTest: "false",
-          goformId: "BAND_SELECT",
-          is_gw_band: 0,
-          gw_band_mask: 0,
-          is_lte_band: 1,
-          lte_band_mask: mask,
-          AD: ad,
-        },
-        function (raw) {
-          var j = parse_result(raw);
-          if (j.result === "success") {
-            toast("LTE Bands locked: " + bands.toUpperCase(), "ok");
-          } else if (!_dev && !S.logged_in_as_developer) {
-            toast("Band lock failed, trying developer login...", "warn");
-            perform_login(function () {
-              S.logged_in_as_developer = true;
-              window.zte_lte_band(bands, true);
-            }, true);
-          } else {
-            toast("LTE Band lock failed.", "error");
-          }
-        },
-      );
+    // Router expects exactly 12 hex digits (matches network_debug.js padLeft(t, 12-t.length))
+    var mask = "0x" + ("000000000000" + n.toString(16)).slice(-12);
+    // Band lock requires developer session — ensure it first
+    ensure_developer_login(function () {
+      get_ad_token(function (ad) {
+        ajax_post(
+          {
+            isTest: "false",
+            goformId: "BAND_SELECT",
+            is_gw_band: 0,
+            gw_band_mask: 0,
+            is_lte_band: 1,
+            lte_band_mask: mask,
+            AD: ad,
+          },
+          function (raw) {
+            var j = parse_result(raw);
+            if (j.result === "success") {
+              toast("LTE Bands locked: " + bands.toUpperCase(), "ok");
+            } else {
+              toast("LTE Band lock failed: " + JSON.stringify(j), "error");
+            }
+          },
+        );
+      });
     });
   };
 
@@ -1452,22 +1573,25 @@
     }
     var mask = trimmed.split("+").join(",");
     var nr_type = S.signal.is_5g_nsa ? "1" : "0"; // 0=SA, 1=NSA
-    get_ad_token(function (ad) {
-      ajax_post(
-        {
-          isTest: "false",
-          goformId: "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
-          nr5g_band_mask: mask,
-          type: nr_type,
-          AD: ad,
-        },
-        function (raw) {
-          var j = parse_result(raw);
-          if (j.result === "success")
-            toast("5G Bands locked: " + trimmed.toUpperCase(), "ok");
-          else toast("5G Band error: " + JSON.stringify(j), "error");
-        },
-      );
+    // NR band lock requires developer session — ensure it first
+    ensure_developer_login(function () {
+      get_ad_token(function (ad) {
+        ajax_post(
+          {
+            isTest: "false",
+            goformId: "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
+            nr5g_band_mask: mask,
+            type: nr_type,
+            AD: ad,
+          },
+          function (raw) {
+            var j = parse_result(raw);
+            if (j.result === "success")
+              toast("5G Bands locked: " + trimmed.toUpperCase(), "ok");
+            else toast("5G Band error: " + JSON.stringify(j), "error");
+          },
+        );
+      });
     });
   };
 
@@ -1510,32 +1634,29 @@
       )
     )
       return;
-    get_ad_token(function (ad) {
-      ajax_post(
-        {
-          isTest: "false",
-          goformId: "BAND_SELECT",
-          is_gw_band: "0",
-          gw_band_mask: "0",
-          is_lte_band: "1",
-          lte_band_mask: "0xA3E2AB0908DF",
-          AD: ad,
-        },
-        function (raw) {
-          var j = parse_result(raw);
-          if (j.result === "success") {
-            toast("LTE band lock removed — all bands allowed", "ok");
-          } else if (!S.logged_in_as_developer) {
-            toast("LTE unlock failed, trying developer login...", "warn");
-            perform_login(function () {
-              S.logged_in_as_developer = true;
-              window.zte_lte_band_unlock();
-            }, true);
-          } else {
-            toast("LTE band unlock failed: " + JSON.stringify(j), "error");
-          }
-        },
-      );
+    // Band unlock requires developer session — ensure it first
+    ensure_developer_login(function () {
+      get_ad_token(function (ad) {
+        ajax_post(
+          {
+            isTest: "false",
+            goformId: "BAND_SELECT",
+            is_gw_band: "0",
+            gw_band_mask: "0",
+            is_lte_band: "1",
+            lte_band_mask: "0xA3E2AB0908DF",
+            AD: ad,
+          },
+          function (raw) {
+            var j = parse_result(raw);
+            if (j.result === "success") {
+              toast("LTE band lock removed — all bands allowed", "ok");
+            } else {
+              toast("LTE band unlock failed: " + JSON.stringify(j), "error");
+            }
+          },
+        );
+      });
     });
   };
 
@@ -1549,22 +1670,25 @@
     )
       return;
     var nr_type = S.signal.is_5g_nsa ? "1" : "0";
-    get_ad_token(function (ad) {
-      ajax_post(
-        {
-          isTest: "false",
-          goformId: "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
-          nr5g_band_mask: "",
-          type: nr_type,
-          AD: ad,
-        },
-        function (raw) {
-          var j = parse_result(raw);
-          if (j.result === "success")
-            toast("NR band lock removed — all 5G bands allowed", "ok");
-          else toast("NR band unlock failed: " + JSON.stringify(j), "error");
-        },
-      );
+    // NR band unlock requires developer session — ensure it first
+    ensure_developer_login(function () {
+      get_ad_token(function (ad) {
+        ajax_post(
+          {
+            isTest: "false",
+            goformId: "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
+            nr5g_band_mask: "",
+            type: nr_type,
+            AD: ad,
+          },
+          function (raw) {
+            var j = parse_result(raw);
+            if (j.result === "success")
+              toast("NR band lock removed — all 5G bands allowed", "ok");
+            else toast("NR band unlock failed: " + JSON.stringify(j), "error");
+          },
+        );
+      });
     });
   };
 
@@ -1578,49 +1702,51 @@
     )
       return;
     var nr_type = S.signal.is_5g_nsa ? "1" : "0";
-    // Chain: LTE unlock → NR unlock
-    get_ad_token(function (ad) {
-      ajax_post(
-        {
-          isTest: "false",
-          goformId: "BAND_SELECT",
-          is_gw_band: "0",
-          gw_band_mask: "0",
-          is_lte_band: "1",
-          lte_band_mask: "0xA3E2AB0908DF",
-          AD: ad,
-        },
-        function (raw_lte) {
-          var jl = parse_result(raw_lte);
-          get_ad_token(function (ad2) {
-            ajax_post(
-              {
-                isTest: "false",
-                goformId: "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
-                nr5g_band_mask: "",
-                type: nr_type,
-                AD: ad2,
-              },
-              function (raw_nr) {
-                var jn = parse_result(raw_nr);
-                var lte_ok = jl.result === "success";
-                var nr_ok = jn.result === "success";
-                if (lte_ok && nr_ok) {
-                  toast("All band locks removed (LTE + NR)", "ok");
-                } else {
-                  toast(
-                    "Partial: LTE=" +
-                      (lte_ok ? "OK" : "FAIL") +
-                      " NR=" +
-                      (nr_ok ? "OK" : "FAIL"),
-                    lte_ok || nr_ok ? "warn" : "error",
-                  );
-                }
-              },
-            );
-          });
-        },
-      );
+    // Both unlocks require developer session — ensure it once, then chain
+    ensure_developer_login(function () {
+      get_ad_token(function (ad) {
+        ajax_post(
+          {
+            isTest: "false",
+            goformId: "BAND_SELECT",
+            is_gw_band: "0",
+            gw_band_mask: "0",
+            is_lte_band: "1",
+            lte_band_mask: "0xA3E2AB0908DF",
+            AD: ad,
+          },
+          function (raw_lte) {
+            var jl = parse_result(raw_lte);
+            get_ad_token(function (ad2) {
+              ajax_post(
+                {
+                  isTest: "false",
+                  goformId: "WAN_PERFORM_NR5G_SANSA_BAND_LOCK",
+                  nr5g_band_mask: "",
+                  type: nr_type,
+                  AD: ad2,
+                },
+                function (raw_nr) {
+                  var jn = parse_result(raw_nr);
+                  var lte_ok = jl.result === "success";
+                  var nr_ok = jn.result === "success";
+                  if (lte_ok && nr_ok) {
+                    toast("All band locks removed (LTE + NR)", "ok");
+                  } else {
+                    toast(
+                      "Partial: LTE=" +
+                        (lte_ok ? "OK" : "FAIL") +
+                        " NR=" +
+                        (nr_ok ? "OK" : "FAIL"),
+                      lte_ok || nr_ok ? "warn" : "error",
+                    );
+                  }
+                },
+              );
+            });
+          },
+        );
+      });
     });
   };
 
@@ -1897,26 +2023,51 @@
     );
   };
 
-  window.zte_show_hidden = function () {
-    toast("Hidden settings revealed", "info");
-    var cnt = 0;
-    var t = setInterval(function () {
-      document.querySelectorAll(".hide").forEach(function (el) {
-        if (!el.dataset.zteUnhidden) {
-          el.classList.remove("hide");
-          el.dataset.zteUnhidden = "1";
-          var tag = document.createElement("span");
-          tag.style.cssText = "font-size:10px;color:#888;margin-left:4px;";
-          tag.textContent = "[hidden]";
-          el.appendChild(tag);
-        }
+  // ── Show Hidden Menus toggle ─────────────────────────────────────────────
+  // S.hidden_active persists across page navigations (hash changes).
+  // apply_hidden_menus() is called on every hash change when active.
+  S.hidden_active = CFG.show_hidden_default;
+
+  function apply_hidden_menus() {
+    if (!S.hidden_active) return;
+    document.querySelectorAll(".hide").forEach(function (el) {
+      if (!el.dataset.zteUnhidden) {
+        el.classList.remove("hide");
+        el.dataset.zteUnhidden = "1";
+        var tag = document.createElement("span");
+        tag.style.cssText = "font-size:10px;color:#888;margin-left:4px;";
+        tag.textContent = "[hidden]";
+        el.appendChild(tag);
+      }
+    });
+    if (document.getElementById("ipv4_section"))
+      document.querySelectorAll("#ipv4_section .row").forEach(function (r) {
+        r.style.display = "block";
       });
-      if (document.getElementById("ipv4_section"))
-        document.querySelectorAll("#ipv4_section .row").forEach(function (r) {
-          r.style.display = "block";
-        });
-      if (++cnt >= 30) clearInterval(t);
-    }, 1000);
+  }
+
+  // Hook hash changes so hidden menus are re-applied after navigation
+  window.addEventListener("hashchange", function () {
+    // Page content re-renders on hash change; re-apply after a short delay
+    setTimeout(apply_hidden_menus, 600);
+    setTimeout(apply_hidden_menus, 1500);
+  });
+  // Also run on a slow interval to catch dynamically injected .hide elements
+  setInterval(apply_hidden_menus, 2000);
+
+  window.zte_show_hidden = function () {
+    S.hidden_active = !S.hidden_active;
+    var btn = document.getElementById("zte_hidden_btn");
+    if (btn) {
+      btn.className = "zte_btn" + (S.hidden_active ? " ok" : "");
+      btn.textContent = S.hidden_active ? "👁 Hidden Menus: ON" : "👁 Hidden Menus: OFF";
+    }
+    if (S.hidden_active) {
+      apply_hidden_menus();
+      toast("Hidden menus: ON", "ok");
+    } else {
+      toast("Hidden menus: OFF — reload page to re-hide", "info");
+    }
   };
 
   window.zte_test_connection = function () {
@@ -2081,6 +2232,27 @@
       (parseInt(t.monthly_tx_bytes) || 0) + (parseInt(t.monthly_rx_bytes) || 0);
     zset("zte_month_total", fmt_bytes(month_tot));
     zset("zte_month_time", fmt_time(t.monthly_time));
+    // Keep session seconds in S for the session info row
+    S.realtime_secs = parseInt(t.realtime_time) || 0;
+    update_session_info();
+  }
+
+  function update_session_info() {
+    var el = document.getElementById("zte_session_info");
+    if (!el) return;
+    var secs = S.realtime_secs || 0;
+    var sessTxt = fmt_time(secs);
+    var extra = "";
+    if (CFG.ip_cycle_hours > 0) {
+      var cycleSecs = CFG.ip_cycle_hours * 3600;
+      var remaining = cycleSecs - (secs % cycleSecs);
+      // Colour: red when < 5 min, orange when < 15 min
+      var colour = remaining < 300 ? "#D32F2F" : remaining < 900 ? "#E65100" : "#388E3C";
+      extra = ' &nbsp;<span style="font-size:10px;color:' + colour + ';font-weight:700;" '
+            + 'title="Time until next automatic IP reassignment">IP ↻ ' + fmt_time(remaining) + '</span>';
+    }
+    el.innerHTML = sessTxt + extra;
+    ztoggle("zte_session_row", true);
   }
 
   window.zte_reset_traffic = function () {
@@ -2161,12 +2333,12 @@
     s.id = "zte_tm_style";
     s.textContent = [
       "#zte_panel{position:fixed;top:12px;left:12px;z-index:2147483646;width:440px;max-height:94vh;",
-      "background:#FFFFFF;color:#37474F;border-radius:12px 12px 0px 0px;box-shadow:0 8px 32px rgba(0,0,0,.15);",
+      "background:#FFFFFF;color:#37474F;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.15);",
       'font-family:"Segoe UI",Verdana,sans-serif;font-size:12px;border:1px solid #B0BEC5;',
       "display:flex;flex-direction:column;}",
       "#zte_panel *{box-sizing:border-box;}",
       "#zte_hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;",
-      "background:linear-gradient(135deg,#1976D2,#1565C0);border-radius:12px 12px 0px 0px;cursor:move;user-select:none;border-bottom:1px solid #1565C0;",
+      "background:linear-gradient(135deg,#1976D2,#1565C0);border-radius:12px 12px 0 0;cursor:move;user-select:none;border-bottom:1px solid #1565C0;",
       "position:sticky;top:0;z-index:10;flex-shrink:0;}",
       "#zte_hdr h2{margin:0;font-size:13px;font-weight:700;color:#FFFFFF;letter-spacing:.5px;}",
       "#zte_status_dot{width:10px;height:10px;border-radius:50%;background:#78909C;display:inline-block;margin-right:6px;transition:background .5s;}",
@@ -2366,6 +2538,7 @@
       '<div class="zte_row" id="txp"><span class="zte_label">TX Power</span><span class="zte_value" id="tx_power">—</span></div>' +
       '<div class="zte_row" id="temperature"><span class="zte_label">Temp</span><span class="zte_value" id="temps">—</span></div>' +
       '<div class="zte_row" id="zte_mccmnc_row"><span class="zte_label">MCC-MNC</span><span class="zte_value" id="zte_mccmnc">—</span></div>' +
+      '<div class="zte_row" id="zte_session_row"><span class="zte_label">Session</span><span class="zte_value" id="zte_session_info">—</span></div>' +
       '<div class="zte_row" id="zte_lock_row" style="display:none;"><span class="zte_label">Cell Lock</span><span class="zte_value" id="zte_lock_status">—</span></div>' +
       "</div>" +
       // ── LTE SIGNAL ────────────────────────────
@@ -2561,8 +2734,12 @@
       '<button class="zte_btn danger" onclick="window.zte_bridge_mode(false)">Bridge OFF</button>' +
       '<button class="zte_btn" onclick="window.zte_arp_proxy(true)">ARP Proxy ON</button>' +
       '<button class="zte_btn danger" onclick="window.zte_arp_proxy(false)">ARP Proxy OFF</button>' +
-      '<button class="zte_btn" onclick="window.zte_show_hidden()">👁 Show Hidden Menus</button>' +
+      '<button id="zte_hidden_btn" onclick="window.zte_show_hidden()"' +
+      (S.hidden_active ? ' class="zte_btn ok">👁 Hidden Menus: ON' : ' class="zte_btn">👁 Hidden Menus: OFF') +
+      '</button>' +
       '<button class="zte_btn" onclick="window.zte_enable_auto_login()">🔑 Auto Login</button>' +
+      '<button class="zte_btn" onclick="window.zte_developer_login()">🛠 Developer Login</button>' +
+      '<button class="zte_btn" onclick="window.zte_go_developer_options()">⚙ Developer Options</button>' +
       '<button class="zte_btn ok" onclick="window.zte_copy_signal()">📋 Copy Signal</button>' +
       '<button class="zte_btn" onclick="window.zte_version_info()">ℹ️ Version</button>' +
       '<button class="zte_btn danger full" onclick="window.zte_reboot(false)">🔄 Reboot Router</button>' +
@@ -2690,132 +2867,132 @@
     }
   }
 
-  // SHA256 polyfill inline (MIT — geraintluff)
+  // SHA256 — clean implementation with verified test vectors
+  // Always inject and use OUR implementation to avoid the router page's
+  // potentially broken window.SHA256 (seen returning init constants = 6A09E667...).
   function inject_sha256() {
-    if (window.SHA256) return;
-    window.SHA256 = (function () {
-      function r(n, t) {
-        return (n >>> t) | (n << (32 - t));
-      }
-      function t(n, t) {
-        return n >>> t;
-      }
-      var e = [
-        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
-        2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
-        1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
-        264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
-        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
-        113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
-        1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
-        3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
-        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
-        1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
-        2428436474, 2756734187, 3204031479, 3329325298,
+    window.SHA256 = function sha256(str) {
+      function rr(val, n) { return (val >>> n) | (val << (32 - n)); }
+      function s0(x)  { return rr(x,  7) ^ rr(x, 18) ^ (x >>>  3); }
+      function s1(x)  { return rr(x, 17) ^ rr(x, 19) ^ (x >>> 10); }
+      function S0(x)  { return rr(x,  2) ^ rr(x, 13) ^ rr(x, 22); }
+      function S1(x)  { return rr(x,  6) ^ rr(x, 11) ^ rr(x, 25); }
+      function Ch(x,y,z)  { return (x & y) ^ (~x & z); }
+      function Maj(x,y,z) { return (x & y) ^ (x & z) ^ (y & z); }
+
+      var K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
       ];
-      return function (n) {
-        var o,
-          h,
-          u,
-          a,
-          f,
-          i,
-          c,
-          s,
-          v,
-          l,
-          y,
-          p,
-          w = [];
-        n = unescape(encodeURIComponent(n));
-        var d = n.length,
-          g = [
-            (o = 1779033703),
-            (h = 3144134277),
-            (u = 1013904242),
-            (a = 2773480762),
-            (f = 1359893119),
-            (i = 2600822924),
-            (c = 528734635),
-            (s = 1541325730),
-          ],
-          b = [];
-        for (var m = 0; m < d; m++)
-          b[m >> 2] |= n.charCodeAt(m) << ((3 - (m % 4)) * 8);
-        b[d >> 2] |= 128 << ((3 - (d % 4)) * 8);
-        b[14 + (((16 + d) >> 6) << 4)] = 8 * d;
-        for (var m = 0; m < b.length; m += 16) {
-          for (var j = w, q = 0; q < 16; q++) j[q] = b[m + q];
-          for (var q = 16; q < 64; q++)
-            j[q] =
-              (r(j[q - 2], 17) ^ r(j[q - 2], 19) ^ t(j[q - 2], 10)) +
-              j[q - 7] +
-              (r(j[q - 15], 7) ^ r(j[q - 15], 18) ^ t(j[q - 15], 3)) +
-              j[q - 16];
-          var x = o,
-            E = h,
-            S = u,
-            B = a,
-            C = f,
-            D = i,
-            F = c,
-            G = s;
-          for (var q = 0; q < 64; q++) {
-            var H =
-                G +
-                (r(C, 6) ^ r(C, 11) ^ r(C, 25)) +
-                ((C & D) ^ (~C & F)) +
-                e[q] +
-                j[q],
-              I =
-                (r(x, 2) ^ r(x, 13) ^ r(x, 22)) + ((x & E) ^ (x & S) ^ (E & S));
-            ((G = F),
-              (F = D),
-              (D = C),
-              (C = (B + H) | 0),
-              (B = S),
-              (S = E),
-              (E = x),
-              (x = (H + I) | 0));
-          }
-          ((o = (o + x) | 0),
-            (h = (h + E) | 0),
-            (u = (u + S) | 0),
-            (a = (a + B) | 0),
-            (f = (f + C) | 0),
-            (i = (i + D) | 0),
-            (c = (c + F) | 0),
-            (s = (s + G) | 0));
+
+      // UTF-8 encode
+      var bytes = unescape(encodeURIComponent(str));
+      var len = bytes.length;
+
+      // Build message words (big-endian 32-bit)
+      var words = [];
+      for (var i = 0; i < len; i++)
+        words[i >> 2] = (words[i >> 2] || 0) | (bytes.charCodeAt(i) << (24 - (i % 4) * 8));
+
+      // Padding
+      words[len >> 2] = (words[len >> 2] || 0) | (0x80 << (24 - (len % 4) * 8));
+      var padded_len = (((len + 9) >> 6) + 1) * 16;
+      words[padded_len - 1] = len * 8;         // low 32-bits of bit length
+      words[padded_len - 2] = (len / 0x20000000) | 0;  // high 32-bits
+
+      // Initial hash values
+      var H = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+      ];
+
+      // Process blocks
+      for (var blk = 0; blk < padded_len; blk += 16) {
+        var W = [];
+        for (var t = 0; t < 16; t++) W[t] = words[blk + t] | 0;
+        for (var t = 16; t < 64; t++)
+          W[t] = (s1(W[t-2]) + W[t-7] + s0(W[t-15]) + W[t-16]) | 0;
+
+        var a = H[0], b = H[1], c2 = H[2], d = H[3],
+            e = H[4], f = H[5], g = H[6], h = H[7];
+
+        for (var t = 0; t < 64; t++) {
+          var T1 = (h + S1(e) + Ch(e,f,g) + K[t] + W[t]) | 0;
+          var T2 = (S0(a) + Maj(a,b,c2)) | 0;
+          h = g; g = f; f = e;
+          e = (d + T1) | 0;
+          d = c2; c2 = b; b = a;
+          a = (T1 + T2) | 0;
         }
-        var J = "";
-        for (var m = 0; m < 8; m++) {
-          var K = g[m];
-          J +=
-            ((K >>> 28) & 15).toString(16) +
-            ((K >>> 24) & 15).toString(16) +
-            ((K >>> 20) & 15).toString(16) +
-            ((K >>> 16) & 15).toString(16) +
-            ((K >>> 12) & 15).toString(16) +
-            ((K >>> 8) & 15).toString(16) +
-            ((K >>> 4) & 15).toString(16) +
-            (K & 15).toString(16);
-        }
-        return J;
-      };
-    })();
+
+        H[0] = (H[0] + a)  | 0;
+        H[1] = (H[1] + b)  | 0;
+        H[2] = (H[2] + c2) | 0;
+        H[3] = (H[3] + d)  | 0;
+        H[4] = (H[4] + e)  | 0;
+        H[5] = (H[5] + f)  | 0;
+        H[6] = (H[6] + g)  | 0;
+        H[7] = (H[7] + h)  | 0;
+      }
+
+      // Produce hex string
+      var hex = "";
+      for (var i = 0; i < 8; i++) {
+        hex += ("00000000" + (H[i] >>> 0).toString(16)).slice(-8);
+      }
+      // Return UPPERCASE to match the behaviour of paswordAlgorithmsCookie
+      return hex.toUpperCase();
+    };
+
     if (!window.hex_md5) window.hex_md5 = window.SHA256;
-    console.log("[ZTE] SHA256 polyfill injected.");
+    console.log("[ZTE] SHA256 builtin injected (UPPERCASE output)");
   }
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  SHA MODE — controlled by CFG.sha_mode
+  //  "page"    → router page's window.SHA256 (= paswordAlgorithmsCookie)
+  //              natively UPPERCASE, identical behaviour to the browser
+  //  "builtin" → our embedded SHA256 implementation (also returns UPPERCASE)
+  //              useful if the page hasn't loaded window.SHA256 yet
+  // ─────────────────────────────────────────────────────────────────────────────
   function setup_hash() {
+    var mode = CFG.sha_mode || "page";
+
+    if (mode === "builtin") {
+      inject_sha256(); // our implementation → window.SHA256 = builtin UPPERCASE
+      S.hash_fn = window.SHA256;
+      console.log("[ZTE] sha_mode=builtin — using embedded SHA256");
+      return true;
+    }
+
+    // mode === "page": use the router page's own hash function
+    // Prova SHA256 prima, poi hex_md5 come fallback
     if (window.SHA256) {
       S.hash_fn = window.SHA256;
+      console.log("[ZTE] sha_mode=page — using router page window.SHA256");
       return true;
     }
     if (window.hex_md5) {
       S.hash_fn = window.hex_md5;
+      console.log("[ZTE] sha_mode=page — using router page window.hex_md5 (fallback)");
       return true;
     }
+
+    // Page hash function not ready yet — retry on next interval
     return false;
   }
 
@@ -2839,28 +3016,27 @@
   }
 
   function bootstrap() {
-    ensure_jquery(function () {
-      var tries = 0;
-      function try_init() {
-        tries++;
-        if (setup_hash()) {
-          ajax_get(
-            { cmd: "wa_inner_version" },
-            function (a) {
-              if (a && a.wa_inner_version) {
-                S.is_mc888 = a.wa_inner_version.indexOf("MC888") > -1;
-                S.is_mc889 = a.wa_inner_version.indexOf("MC889") > -1;
-                if ((S.is_mc888 || S.is_mc889) && window.SHA256)
-                  S.hash_fn = window.SHA256;
-              }
-              auto_login_then_start();
-            },
-            function () {
-              auto_login_then_start();
-            },
-          );
-          return;
+    var tries = 0;
+    function try_init() {
+      tries++;
+      if (!setup_hash()) {
+        // sha_mode="page" but the page hasn't loaded SHA256/hex_md5 yet
+        if (tries < CFG.maxInitRetries) {
+          setTimeout(try_init, CFG.initRetryInterval);
+        } else {
+          // Fallback di emergenza: usiamo la builtin
+          console.warn("[ZTE] window.SHA256 not found after " + tries + " retries, falling back to builtin");
+          inject_sha256();
+          S.hash_fn = window.SHA256;
+          run_after_hash();
         }
+        return;
+      }
+      run_after_hash();
+    }
+
+    function run_after_hash() {
+      ensure_jquery(function () {
         ajax_get(
           { cmd: "wa_inner_version" },
           function (a) {
@@ -2868,24 +3044,17 @@
               S.is_mc888 = a.wa_inner_version.indexOf("MC888") > -1;
               S.is_mc889 = a.wa_inner_version.indexOf("MC889") > -1;
             }
-            inject_sha256();
-            if (setup_hash()) {
-              auto_login_then_start();
-            } else if (tries < CFG.maxInitRetries) {
-              setTimeout(try_init, CFG.initRetryInterval);
-            } else {
-              toast("Init error: hash functions not found.", "error");
-            }
+            auto_login_then_start();
           },
           function () {
-            if (tries < CFG.maxInitRetries)
-              setTimeout(try_init, CFG.initRetryInterval);
+            auto_login_then_start();
           },
         );
-      }
-      try_init();
-    });
-  }
+      }); // ensure_jquery
+    } // run_after_hash
+
+    try_init();
+  } // bootstrap
 
   // ─────────────────────────────────────────────
   //  GO
@@ -2893,3 +3062,4 @@
   console.log("[ZTE] Script v" + CFG.version + " loaded");
   bootstrap();
 })();
+
